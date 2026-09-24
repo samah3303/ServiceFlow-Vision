@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ServiceFlow Manager</title>
+    <link rel="stylesheet" href="/manager.css" />
+  </head>
+  <body>
+    <header class="manager-header">
+      <a class="manager-brand" href="/manager.html"><span>SF</span><div><strong>ServiceFlow</strong><small>Manager</small></div></a>
+      <div class="header-controls">
+        <label>Analyzed shift<select id="runSelect"><option>Latest analysis</option></select></label>
+        <button class="quiet-button" id="managerSettingsButton">Targets</button>
+        <button class="dark-button" id="managerExportButton" disabled>Export shift report</button>
+        <a class="copilot-link" href="/staff.html">Open Shift Copilot ↗</a>
+        <a class="lab-link" href="/">Open Vision Lab ↗</a>
+      </div>
+    </header>
+
+    <main class="manager-main">
+      <section class="manager-intro">
+        <div><span class="overline">RESTAURANT PULSE</span><h1 id="managerGreeting">Your shift, at a glance</h1><p id="managerSubtitle">Waiting for an analyzed recording.</p></div>
+        <div class="quality-chip" id="qualityChip"><span></span> No analysis yet</div>
+      </section>
+
+      <section id="managerEmpty" class="manager-empty">
+        <div>↗</div><h2>No analyzed shift yet</h2><p>Set up the restaurant and analyze camera footage in Vision Lab. The operational summary will appear here automatically.</p><a class="dark-button" href="/">Open Vision Lab</a>
+      </section>
+
+      <div id="managerContent" hidden>
+        <section class="pulse-grid" id="managerMetrics"></section>
+
+        <section class="dashboard-grid action-grid">
+          <article class="panel">
+            <div class="panel-heading"><div><span class="overline">COORDINATION QUEUE</span><h2>Actions still in motion</h2></div><a class="panel-link" href="/staff.html">Open copilot →</a></div>
+            <div id="managerTasks" class="manager-task-list"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><span class="overline">SHIFT REPLAY</span><h2>The moments that mattered</h2></div><span>Maximum five</span></div>
+            <div id="managerReplay" class="replay-list"></div>
+          </article>
+        </section>
+
+        <section class="dashboard-grid primary-grid">
+          <article class="panel floor-panel">
+            <div class="panel-heading"><div><span class="overline">TABLE VIEW</span><h2>Where service happened</h2></div><span id="floorLegend">Darker tables had more activity</span></div>
+            <canvas id="managerFloorCanvas" width="1000" height="620"></canvas>
+          </article>
+          <article class="panel attention-panel">
+            <div class="panel-heading"><div><span class="overline">ATTENTION</span><h2>Review these moments</h2></div><span id="alertCount">0 items</span></div>
+            <div id="managerAlerts" class="alert-list"></div>
+          </article>
+        </section>
+
+        <section class="panel occupancy-panel">
+          <div class="panel-heading"><div><span class="overline">SHIFT FLOW</span><h2>Occupied tables over time</h2></div><span>Derived from detected table sessions</span></div>
+          <canvas id="occupancyChart" width="1200" height="230"></canvas>
+        </section>
+
+        <section class="dashboard-grid secondary-grid">
+          <article class="panel">
+            <div class="panel-heading"><div><span class="overline">TEAM ACTIVITY</span><h2>Observable service presence</h2></div><span>No composite scores</span></div>
+            <div id="managerStaff" class="staff-list"></div>
+            <p class="decision-note">Use these reviewed observations for coaching and process improvement—not as an automated employment decision.</p>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><div><span class="overline">TABLES</span><h2>Turn and response detail</h2></div><span id="tableCountManager"></span></div>
+            <div class="table-wrap"><table><thead><tr><th>Table</th><th>Evidence state</th><th>Turns</th><th>Occupied</th><th>First service</th><th>Visits</th></tr></thead><tbody id="managerTables"></tbody></table></div>
+          </article>
+        </section>
+
+        <section class="confidence-strip">
+          <div><span class="overline">DATA CONFIDENCE</span><strong id="confidenceTitle">Review recommended</strong></div>
+          <p id="confidenceCopy"></p>
+          <a id="reviewWorkspaceLink" href="/?view=review">Validate identities and handoffs →</a>
+        </section>
+      </div>
+    </main>
+
+    <dialog id="managerSettingsDialog">
+      <button class="dialog-close" aria-label="Close">×</button>
+      <span class="overline">OPERATING TARGETS</span><h2>What needs attention?</h2><p>These targets control manager alerts; they do not change the underlying detections.</p>
+      <form id="managerSettingsForm">
+        <label>First service target, seconds<input id="greetingTarget" type="number" min="10" max="600" step="5" /></label>
+        <label>Long table session, minutes<input id="longSession" type="number" min="10" max="360" step="5" /></label>
+        <label>Minimum staff visits per session<input id="minimumVisits" type="number" min="0" max="20" step="1" /></label>
+        <label>Anonymous journey retention, days<input id="retentionDays" type="number" min="1" max="365" step="1" /></label>
+        <button class="dark-button" type="submit">Save targets</button>
+        <button class="quiet-button danger-button" id="pruneDataButton" type="button">Delete expired guest journeys now</button>
+      </form>
+    </dialog>
+
+    <div class="manager-toast" id="managerToast" role="status"></div>
+    <script src="/manager.js"></script>
+  </body>
+</html>

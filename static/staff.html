@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#123a2b" />
+    <title>ServiceFlow Shift Copilot</title>
+    <link rel="stylesheet" href="/staff.css" />
+  </head>
+  <body>
+    <header class="staff-header">
+      <a class="staff-brand" href="/staff.html"><span>SF</span><div><strong>ServiceFlow</strong><small>Shift Copilot</small></div></a>
+      <div class="staff-links"><span class="local-state"><i></i> Local</span><a href="/manager.html">Manager</a><a href="/">Vision Lab</a></div>
+    </header>
+
+    <main class="staff-shell">
+      <section class="identity-bar">
+        <div><span class="overline">ON SHIFT AS</span><select id="actorSelect" aria-label="Choose your staff actor"><option value="">Choose a staff actor</option></select></div>
+        <div id="actorRole" class="role-chip">No role selected</div>
+      </section>
+
+      <section id="noStaff" class="staff-empty" hidden>
+        <div>＋</div><h1>Enroll a staff actor first</h1><p>Add a consented actor and their shift role in Vision Lab. Their actionable queue will appear here.</p><a href="/?view=people">Open staff setup</a>
+      </section>
+
+      <div id="copilotContent" hidden>
+        <section class="shift-intro">
+          <div><span class="overline">NEXT BEST ACTION</span><h1>Recover the moment while it matters.</h1><p id="queueSummary">Choose an actor to see their queue.</p></div>
+          <button class="raise-button" id="raiseTaskButton">＋ Raise a task</button>
+        </section>
+
+        <section class="focus-card" id="focusTask"></section>
+
+        <section class="queue-grid">
+          <article class="queue-panel">
+            <header><div><span class="overline">MY QUEUE</span><h2>Actionable now</h2></div><span id="openCount">0 open</span></header>
+            <div id="taskQueue" class="task-list"></div>
+          </article>
+          <article class="queue-panel">
+            <header><div><span class="overline">SHIFT MEMORY</span><h2>Recently resolved</h2></div><span id="closedCount">0 closed</span></header>
+            <div id="taskHistory" class="task-list compact"></div>
+          </article>
+        </section>
+      </div>
+    </main>
+
+    <dialog id="handoffDialog">
+      <button class="dialog-close" aria-label="Close">×</button><span class="overline">HAND OFF</span><h2>Route this action</h2><p>Choose one accountable person, or route it to the right role.</p>
+      <form id="handoffForm">
+        <input id="handoffTaskId" type="hidden" />
+        <label>Specific person<select id="handoffStaff"><option value="">No specific person</option></select></label>
+        <label>Role<select id="handoffRole"><option value="">Keep current role</option><option value="waiter">Waiter</option><option value="runner">Runner</option><option value="busser">Busser</option><option value="host">Host</option><option value="captain">Captain</option><option value="manager">Manager</option></select></label>
+        <button class="primary-button" type="submit">Send handoff</button>
+      </form>
+    </dialog>
+
+    <dialog id="dismissDialog">
+      <button class="dialog-close" aria-label="Close">×</button><span class="overline">DISMISS</span><h2>Why wasn’t this actionable?</h2><p>Dismissals become feedback for future routing.</p>
+      <form id="dismissForm"><input id="dismissTaskId" type="hidden" /><label>Reason<input id="dismissReason" maxlength="240" placeholder="e.g. Table was already acknowledged" required /></label><button class="primary-button" type="submit">Dismiss with feedback</button></form>
+    </dialog>
+
+    <dialog id="raiseDialog">
+      <button class="dialog-close" aria-label="Close">×</button><span class="overline">RAISE A TASK</span><h2>What needs to happen?</h2><p>Make the requested action concrete enough for one person to complete.</p>
+      <form id="raiseForm">
+        <label>Issue<input id="raiseTitle" maxlength="100" placeholder="e.g. Entrance needs coverage" required /></label>
+        <label>Requested action<input id="raiseAction" maxlength="140" placeholder="e.g. Meet the waiting party now" required /></label>
+        <div class="form-pair"><label>Route to<select id="raiseRole"><option value="waiter">Waiter</option><option value="runner">Runner</option><option value="busser">Busser</option><option value="host">Host</option><option value="captain">Captain</option><option value="manager">Manager</option></select></label><label>Priority<select id="raisePriority"><option value="normal">Normal</option><option value="high">High</option><option value="critical">Critical</option></select></label></div>
+        <div class="form-pair"><label>Table<select id="raiseTable"><option value="">No table</option></select></label><label>Zone<select id="raiseZone"><option value="">No zone</option></select></label></div>
+        <button class="primary-button" type="submit">Create action</button>
+      </form>
+    </dialog>
+
+    <div class="staff-toast" id="staffToast" role="status" aria-live="polite"></div>
+    <script src="/staff.js"></script>
+  </body>
+</html>

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+data/cameras/*
+data/staff/*
+data/project.json
+data/results.json
+data/tasks.json
+data/runs/*
+!data/cameras/.gitkeep
+!data/staff/.gitkeep
+!data/runs/.gitkeep
