@@ -50,14 +50,48 @@ def match_observations(
             cost = (1.0 - overlap) + abs(timestamp - truth_time) / max(time_tolerance, 1e-3) * 0.1
             candidates.append((cost, prediction_index, truth_index))
 
-    matched_predictions, matched_truth, pairs = set(), set(), []
-    for _, prediction_index, truth_index in sorted(candidates):
-        if prediction_index in matched_predictions or truth_index in matched_truth:
-            continue
-        matched_predictions.add(prediction_index)
-        matched_truth.add(truth_index)
-        pairs.append((prediction_index, truth_index))
-    return pairs
+    # Greedy edge selection can lose valid matches in crowded frames: the
+    # locally best pair may consume the only truth box another prediction can
+    # match. Solve each small connected component of the time/IoU candidate
+    # graph as a one-to-one assignment instead. Components stay small because
+    # edges are restricted to one camera and a narrow time window.
+    prediction_edges: Dict[int, List[int]] = defaultdict(list)
+    truth_edges: Dict[int, List[int]] = defaultdict(list)
+    edge_cost: Dict[Tuple[int, int], float] = {}
+    for cost, prediction_index, truth_index in candidates:
+        prediction_edges[prediction_index].append(truth_index)
+        truth_edges[truth_index].append(prediction_index)
+        edge_cost[(prediction_index, truth_index)] = cost
+
+    unseen_predictions = set(prediction_edges)
+    pairs = []
+    maximum_valid_cost = 0.600001  # IoU >= .5 plus at most .1 time penalty.
+    while unseen_predictions:
+        seed = unseen_predictions.pop()
+        component_predictions = {seed}
+        component_truth = set()
+        pending_predictions = [seed]
+        while pending_predictions:
+            prediction_index = pending_predictions.pop()
+            for truth_index in prediction_edges[prediction_index]:
+                if truth_index in component_truth:
+                    continue
+                component_truth.add(truth_index)
+                for neighbor in truth_edges[truth_index]:
+                    if neighbor not in component_predictions:
+                        component_predictions.add(neighbor)
+                        unseen_predictions.discard(neighbor)
+                        pending_predictions.append(neighbor)
+
+        prediction_indices = sorted(component_predictions)
+        truth_indices = sorted(component_truth)
+        costs = [[
+            edge_cost.get((prediction_index, truth_index), 1_000.0)
+            for truth_index in truth_indices
+        ] for prediction_index in prediction_indices]
+        assignments = optimal_assignment(costs, maximum_valid_cost)
+        pairs.extend((prediction_indices[row], truth_indices[column]) for row, column in assignments)
+    return sorted(pairs)
 
 
 def identity_metrics(predictions: Sequence[Dict], truth: Sequence[Dict], pairs: Iterable[Tuple[int, int]]) -> Dict:

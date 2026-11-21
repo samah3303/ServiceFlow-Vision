@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -11,7 +13,14 @@ try:
 except ImportError:  # The colour-histogram fallback keeps setup diagnostics usable.
     Core = None
 
+try:
+    import onnxruntime as ort
+except ImportError:  # OpenCV remains the CPU fallback.
+    ort = None
+
 from .tracking import Detection
+
+_FAILED_BODY_REID_DEVICES = set()
 
 
 class VisionModels:
@@ -32,24 +41,54 @@ class VisionModels:
         if missing:
             raise FileNotFoundError("Missing model files: " + ", ".join(missing))
 
-        self.person_net = cv2.dnn.readNet(str(self.person_model_path))
+        self.requested_device = os.environ.get("SERVICEFLOW_INFERENCE_DEVICE", "auto").lower()
+        if self.requested_device not in {"auto", "gpu", "cpu"}:
+            raise ValueError("SERVICEFLOW_INFERENCE_DEVICE must be auto, gpu or cpu")
+        self.person_net = None
+        self.person_session = None
+        self.person_compiled = None
+        self.person_input_name = None
+        self.person_backend = "OpenCV CPU"
+        self.body_reid_backend = "HSV fallback"
+        self.openvino_core = None
+        if Core is not None:
+            try:
+                self.openvino_core = Core()
+            except RuntimeError:
+                pass
+        self._configure_person_backend()
         self.face_detector = cv2.FaceDetectorYN.create(
-            str(self.face_detector_path), "", (320, 320), 0.82, 0.3, 5000
+            str(self.face_detector_path), "", (320, 320), 0.68, 0.3, 5000
         )
         self.face_recognizer = cv2.FaceRecognizerSF.create(str(self.face_recognizer_path), "")
+        self.face_retry_every = 3
+        self.face_retry_limit = 4
         self.body_reid_net = None
         self.body_reid_output = None
         if self.body_reid_xml_path.exists() and self.body_reid_bin_path.exists():
             try:
-                if Core is None:
+                if self.openvino_core is None:
                     raise RuntimeError("OpenVINO runtime is not installed")
-                core = Core()
-                model = core.read_model(
+                model = self.openvino_core.read_model(
                     model=str(self.body_reid_xml_path),
                     weights=str(self.body_reid_bin_path),
                 )
-                self.body_reid_net = core.compile_model(model, "CPU")
-                self.body_reid_output = self.body_reid_net.output(0)
+                devices = self.openvino_core.available_devices
+                preferred = next((device for device in devices if device.startswith("GPU")), None)
+                if self.requested_device == "cpu":
+                    preferred = None
+                for device in ([preferred, "CPU"] if preferred else ["CPU"]):
+                    failure_key = (str(self.body_reid_xml_path), device)
+                    if failure_key in _FAILED_BODY_REID_DEVICES:
+                        continue
+                    try:
+                        self.body_reid_net = self.openvino_core.compile_model(model, device)
+                        self.body_reid_output = self.body_reid_net.output(0)
+                        self.body_reid_backend = f"OpenVINO {device}"
+                        break
+                    except (RuntimeError, ValueError) as error:
+                        _FAILED_BODY_REID_DEVICES.add(failure_key)
+                        logging.warning("Body ReID unavailable on %s: %s", device, error)
             except (RuntimeError, ValueError):
                 # The application remains inspectable with its colour-histogram
                 # fallback if the optional runtime cannot initialize.
@@ -58,6 +97,59 @@ class VisionModels:
         self.input_size = 640
         self._grid: Optional[np.ndarray] = None
         self._expanded_strides: Optional[np.ndarray] = None
+
+    def _configure_person_backend(self) -> None:
+        if self.requested_device != "cpu" and ort is not None:
+            providers = ort.get_available_providers()
+            candidates = []
+            if "CUDAExecutionProvider" in providers:
+                candidates.append(("CUDAExecutionProvider", {}, "ONNX Runtime CUDA"))
+            if "CoreMLExecutionProvider" in providers:
+                candidates.append(("CoreMLExecutionProvider", {
+                    "ModelFormat": "MLProgram",
+                    "MLComputeUnits": "ALL",
+                    "RequireStaticInputShapes": "1",
+                    "EnableOnSubgraphs": "1",
+                }, "ONNX Runtime Core ML"))
+            for provider, options, label in candidates:
+                try:
+                    session_options = ort.SessionOptions()
+                    session_options.log_severity_level = 3
+                    session = ort.InferenceSession(
+                        str(self.person_model_path), sess_options=session_options,
+                        providers=[(provider, options), "CPUExecutionProvider"],
+                    )
+                    if provider not in session.get_providers():
+                        continue
+                    self.person_session = session
+                    self.person_input_name = session.get_inputs()[0].name
+                    self.person_backend = label
+                    return
+                except Exception as error:
+                    logging.warning("Person detector unavailable on %s: %s", label, error)
+
+        if self.requested_device != "cpu" and self.openvino_core is not None:
+            for device in self.openvino_core.available_devices:
+                if not device.startswith("GPU"):
+                    continue
+                try:
+                    self.person_compiled = self.openvino_core.compile_model(str(self.person_model_path), device)
+                    self.person_backend = f"OpenVINO {device}"
+                    return
+                except (RuntimeError, ValueError) as error:
+                    logging.warning("Person detector unavailable on OpenVINO %s: %s", device, error)
+
+        if self.requested_device == "gpu":
+            logging.warning("No compatible GPU inference backend is available; using OpenCV CPU")
+        self.person_net = cv2.dnn.readNet(str(self.person_model_path))
+
+    def runtime_info(self) -> Dict[str, str]:
+        return {
+            "personDetector": self.person_backend,
+            "faceDetector": "OpenCV YuNet CPU with person-crop retry",
+            "faceRecognizer": "OpenCV SFace CPU",
+            "bodyReidentification": self.body_reid_backend,
+        }
 
     def _anchors(self) -> Tuple[np.ndarray, np.ndarray]:
         if self._grid is not None and self._expanded_strides is not None:
@@ -86,9 +178,14 @@ class VisionModels:
         padded = np.full((self.input_size, self.input_size, 3), 114, dtype=np.uint8)
         padded[: resized.shape[0], : resized.shape[1]] = resized
         # This OpenCV Zoo export expects unscaled RGB float values in NCHW order.
-        blob = np.transpose(padded[:, :, ::-1].astype(np.float32), (2, 0, 1))[None, ...]
-        self.person_net.setInput(blob)
-        output = np.asarray(self.person_net.forward())
+        blob = np.ascontiguousarray(np.transpose(padded[:, :, ::-1].astype(np.float32), (2, 0, 1))[None, ...])
+        if self.person_session is not None:
+            output = np.asarray(self.person_session.run(None, {self.person_input_name: blob})[0])
+        elif self.person_compiled is not None:
+            output = np.asarray(next(iter(self.person_compiled([blob]).values())))
+        else:
+            self.person_net.setInput(blob)
+            output = np.asarray(self.person_net.forward())
         if output.ndim == 2:
             output = output[None, ...]
         if output.shape[-1] != 85:
@@ -124,30 +221,43 @@ class VisionModels:
         kept = np.asarray(indices).reshape(-1).tolist() if len(indices) else []
         return [([float(value) for value in boxes[index]], clean_scores[index]) for index in kept]
 
-    def detect_faces(self, frame: np.ndarray) -> List[Tuple[np.ndarray, List[float]]]:
+    def _face_candidates(self, frame: np.ndarray, max_dimension: Optional[int] = None) -> List[np.ndarray]:
         height, width = frame.shape[:2]
-        self.face_detector.setInputSize((width, height))
-        _, faces = self.face_detector.detect(frame)
+        scale = min(1.0, max_dimension / max(width, height)) if max_dimension else 1.0
+        search = cv2.resize(frame, None, fx=scale, fy=scale) if scale < 1.0 else frame
+        self.face_detector.setInputSize((search.shape[1], search.shape[0]))
+        _, faces = self.face_detector.detect(search)
         if faces is None:
             return []
+        if scale < 1.0:
+            faces = faces.copy()
+            faces[:, :14] /= scale
+        return list(faces)
+
+    def _face_embedding(self, frame: np.ndarray, face: np.ndarray) -> Optional[List[float]]:
+        try:
+            aligned = self.face_recognizer.alignCrop(frame, face)
+            feature = self.face_recognizer.feature(aligned).reshape(-1).astype(np.float32)
+            norm = float(np.linalg.norm(feature))
+            if norm:
+                feature /= norm
+                return feature.astype(float).tolist()
+        except cv2.error:
+            pass
+        return None
+
+    def detect_faces(self, frame: np.ndarray) -> List[Tuple[np.ndarray, List[float]]]:
         results = []
-        for face in faces:
-            try:
-                aligned = self.face_recognizer.alignCrop(frame, face)
-                feature = self.face_recognizer.feature(aligned).reshape(-1).astype(np.float32)
-                norm = float(np.linalg.norm(feature))
-                if norm:
-                    feature /= norm
-                results.append((face, feature.astype(float).tolist()))
-            except cv2.error:
-                continue
+        for face in self._face_candidates(frame):
+            embedding = self._face_embedding(frame, face)
+            if embedding is not None:
+                results.append((face, embedding))
         return results
 
-    def detections(self, frame: np.ndarray) -> List[Detection]:
+    def detections(self, frame: np.ndarray, frame_index: int = 0) -> List[Detection]:
         # ByteTrack's second association pass uses lower-confidence detections
         # to bridge partial occlusions; only high-confidence boxes start tracks.
         people = self.detect_people(frame, confidence=0.12)
-        faces = self.detect_faces(frame)
         detections = []
         frame_height, frame_width = frame.shape[:2]
         for box, score in people:
@@ -158,17 +268,43 @@ class VisionModels:
                 appearance = self.body_embedding(crop)
             detections.append(Detection(bbox=box, score=score, appearance=appearance))
 
-        for face, embedding in faces:
+        if not detections:
+            return detections
+        matched_faces: Dict[int, np.ndarray] = {}
+        for face in self._face_candidates(frame, max_dimension=1280):
             fx, fy, fw, fh = [float(value) for value in face[:4]]
             center = (fx + fw / 2, fy + fh / 2)
             containing = []
             for index, detection in enumerate(detections):
                 x, y, width, height = detection.bbox
-                if x <= center[0] <= x + width and y <= center[1] <= y + height:
+                if x <= center[0] <= x + width and y <= center[1] <= y + 0.72 * height:
                     containing.append((width * height, index))
             if containing:
                 _, index = min(containing)
-                detections[index].embedding = embedding
+                previous = matched_faces.get(index)
+                if previous is None or float(face[14]) > float(previous[14]):
+                    matched_faces[index] = face
+        for index, face in matched_faces.items():
+            detections[index].embedding = self._face_embedding(frame, face)
+
+        if frame_index % self.face_retry_every == 0:
+            candidates = sorted(
+                (detection for detection in detections if detection.embedding is None and detection.score >= 0.35),
+                key=lambda detection: detection.bbox[2] * detection.bbox[3], reverse=True,
+            )[:self.face_retry_limit]
+            for detection in candidates:
+                x, y, width, height = [int(value) for value in detection.bbox]
+                roi = frame[max(0, y):min(frame_height, y + round(height * 0.72)),
+                            max(0, x):min(frame_width, x + width)]
+                if roi.shape[0] < 40 or roi.shape[1] < 40:
+                    continue
+                scale = min(2.5, 640 / max(roi.shape[:2]))
+                if scale > 1.1:
+                    roi = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                roi_faces = self._face_candidates(roi)
+                if roi_faces:
+                    face = max(roi_faces, key=lambda item: float(item[2] * item[3] * item[14]))
+                    detection.embedding = self._face_embedding(roi, face)
         return detections
 
     def body_embedding(self, person_crop: np.ndarray) -> Optional[List[float]]:

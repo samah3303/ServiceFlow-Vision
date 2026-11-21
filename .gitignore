@@ -10,3 +10,6 @@ data/runs/*
 !data/cameras/.gitkeep
 !data/staff/.gitkeep
 !data/runs/.gitkeep
+kernel.errors.txt
+uncommitted_fixes.patch
+~$*

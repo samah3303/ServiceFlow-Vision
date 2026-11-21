@@ -37,6 +37,12 @@ The local tracker in `app/tracking.py` is a compact independent implementation o
 - Paper: Yifu Zhang et al., “ByteTrack: Multi-Object Tracking by Associating Every Detection,” ECCV 2022 — https://arxiv.org/abs/2110.06864
 - Reference repository (MIT License): https://github.com/ifzhang/ByteTrack
 
+## RapidOCR timestamp recognition
+
+The optional local OCR dependency `rapidocr` reads timestamps already burned into camera frames. Its Python package includes OCR model files installed with the dependency; those files are not copied into this repository's `models/` folder. RapidOCR is published under Apache License 2.0; review its model and package notices before redistribution.
+
+- Project and licence: https://github.com/RapidAI/RapidOCR
+
 ## Deliberately not bundled
 
 This prototype does not bundle Ultralytics, BoxMOT or InsightFace software or weights. Their licences and model-specific terms require a separate product/legal decision if considered later.

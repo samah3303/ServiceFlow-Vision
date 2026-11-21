@@ -172,6 +172,16 @@
             </div>
           </div>
 
+          <div class="clock-panel">
+            <div>
+              <span class="eyebrow">CAMERA CLOCKS</span>
+              <h3>Align recordings from their on-screen timestamps</h3>
+              <p>ServiceFlow reads several frames from each video. Consistent clock readings update the timeline offsets automatically; uncertain readings leave your existing offsets untouched.</p>
+            </div>
+            <button class="button secondary" id="syncTimestampsButton" type="button">Sync camera times</button>
+            <div id="timestampSyncList" class="clock-list"></div>
+          </div>
+
           <div class="calibration-panel" id="calibrationPanel">
             <div class="section-heading compact">
               <div>
@@ -191,6 +201,48 @@
             <div class="calibration-footer">
               <div id="calibrationPoints" class="point-pills"></div>
               <div class="button-row"><button class="button ghost" id="undoCalibration">Undo point</button><button class="button secondary" id="placeCameraButton">Place camera icon</button></div>
+            </div>
+          </div>
+
+          <div class="manual-panel" id="manualPanel">
+            <div class="section-heading compact">
+              <div>
+                <span class="eyebrow">HUMAN-ASSISTED DETECTION</span>
+                <h3>Mark people already in the frame</h3>
+                <p>Pause a camera, draw around a seated customer or staff actor, then specify when that person leaves the marked position. These markings are used in the next analysis.</p>
+              </div>
+              <select id="manualCameraSelect" aria-label="Camera to mark people"></select>
+            </div>
+            <div class="manual-grid">
+              <div>
+                <div class="manual-video-wrap" id="manualVideoWrap">
+                  <video id="manualVideo" muted playsinline preload="metadata"></video>
+                  <canvas id="manualCanvas" width="800" height="450" aria-label="Draw a box around a person"></canvas>
+                </div>
+                <div class="manual-video-controls">
+                  <button class="button secondary" id="manualPlayButton" type="button">Play</button>
+                  <span id="manualCurrentTime">00:00</span>
+                  <input id="manualTimeline" type="range" min="0" max="1" step="0.1" value="0" aria-label="Camera video position" />
+                  <span id="manualDuration">00:00</span>
+                </div>
+                <p class="manual-note">A marking applies only to the time range you enter. If the person moves or leaves, stop the range there and add another box if needed. Review results before using them for decisions.</p>
+              </div>
+              <div>
+                <form class="form-card manual-form" id="manualMarkForm">
+                  <h3>New person marking</h3>
+                  <p id="manualDrawStatus">Pause the video, then drag a box around one person.</p>
+                  <label>Role<select id="manualRole"><option value="customer">Customer</option><option value="staff">Staff actor</option></select></label>
+                  <label id="manualStaffWrap" hidden>Staff profile<select id="manualStaff"></select></label>
+                  <label>Table<select id="manualTable"></select></label>
+                  <div class="manual-time-fields">
+                    <label>From second<input id="manualStart" type="number" min="0" step="0.1" required /></label>
+                    <label>Until second<input id="manualEnd" type="number" min="0" step="0.1" required /></label>
+                  </div>
+                  <button class="button primary full" type="submit">Save marking</button>
+                </form>
+                <div class="list-heading"><h3>Saved markings</h3><span id="manualCountBadge" class="count-badge">0</span></div>
+                <div id="manualMarkList" class="manual-mark-list empty-list">No people marked for this camera.</div>
+              </div>
             </div>
           </div>
 
@@ -243,9 +295,9 @@
               <h3>Add a staff actor</h3>
               <label>Name or actor code<input name="name" placeholder="e.g. Server A / Anika" required /></label>
               <label>Shift role<select name="role" required><option value="waiter">Waiter</option><option value="runner">Runner</option><option value="busser">Busser</option><option value="host">Host</option><option value="captain">Captain</option><option value="manager">Manager</option></select></label>
-              <label class="drop-field portrait">Choose a clear face photo<input name="photo" type="file" accept="image/*" required /><span>Front-facing, evenly lit, one face</span></label>
+              <label class="drop-field portrait">Face photo (optional)<input name="photo" type="file" accept="image/*" /><span>Without a photo, identify this actor from a video box in Review or mark them in Cameras.</span></label>
               <button class="button primary full" type="submit">Create staff profile</button>
-              <p class="form-note">The photo and embedding remain inside this local project.</p>
+              <p class="form-note">Photo-based recognition is available when a clear photo is supplied. Video-only actors need a human identity mark; profiles stay local.</p>
             </form>
             <div>
               <div class="list-heading"><h3>Enrolled staff</h3><span id="staffCountBadge" class="count-badge">0</span></div>
@@ -294,6 +346,7 @@
             <div class="empty-icon">◎</div><h3>No analysis to review</h3><p>Run the footage once, then return here to inspect synchronized camera overlays and correct identities.</p><button class="button secondary" data-go="analyze">Go to analysis</button>
           </div>
           <div id="reviewContent" hidden>
+            <p id="reviewTimingWarning" class="review-timing-warning" hidden>Camera clocks have been corrected since this analysis. The overlays and identity matches below are from the old timing; rerun analysis before using or correcting them.</p>
             <div class="review-player-card">
               <div class="review-video-grid" id="reviewVideoGrid"></div>
               <div class="review-controls">
@@ -302,6 +355,15 @@
                 <input id="reviewTimeline" type="range" min="0" max="1" step="0.05" value="0" aria-label="Synchronized footage time" />
                 <span id="reviewDuration">00:00</span>
               </div>
+              <div class="review-selection" id="reviewSelection" hidden>
+                <div><strong id="reviewSelectedName">Selected person</strong><span id="reviewSelectedDetails"></span><small>Changes to a matched identity can affect its other appearances. Check the full code before applying a role.</small></div>
+                <button class="button secondary" id="reviewSelectForCorrection" type="button">Use in correction forms</button>
+                <label>Staff actor<select id="reviewQuickStaff"></select></label>
+                <button class="button secondary" id="reviewAssignStaff" type="button">Assign as staff</button>
+                <button class="button ghost" id="reviewPrepareStaffMark" type="button">Mark in next analysis</button>
+                <button class="button ghost" id="reviewAssignCustomer" type="button">Mark customer</button>
+              </div>
+              <p class="review-click-hint">Click a colored person box in a camera view to select it and reveal its full identity.</p>
             </div>
 
             <div class="review-workspace">
@@ -363,6 +425,7 @@
           </div>
           <div id="reportContent" hidden>
             <div class="metric-grid" id="reportMetrics"></div>
+            <div class="report-card calibration-report"><div class="card-heading"><h3>Camera alignment check</h3><span>Clocks and floor-plan geometry</span></div><div id="reportCalibration"></div></div>
             <div class="report-grid">
               <div class="report-card map-report"><div class="card-heading"><h3>Movement map</h3><span>All cameras combined</span></div><canvas id="reportMapCanvas" width="1000" height="650"></canvas></div>
               <div class="report-card"><div class="card-heading"><h3>Staff activity</h3><span>Detected table interactions</span></div><div id="staffReport"></div></div>

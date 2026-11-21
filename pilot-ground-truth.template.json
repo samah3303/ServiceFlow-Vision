@@ -1,0 +1,10 @@
+{
+  "schema": "serviceflow-ground-truth/v1",
+  "clipId": "replace-with-actor-shift-id",
+  "split": "validation",
+  "samplingSeconds": 0.333,
+  "notes": "Review sampled frames from the source video. Include every visible person, including seated people who are not moving. Keep an identity stable only when the footage supports it.",
+  "observations": [],
+  "sessions": [],
+  "handoffs": []
+}

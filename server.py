@@ -25,6 +25,8 @@ import cv2
 import numpy as np
 
 from app.analytics import VideoAnalyzer
+from app.consistency import enforce_same_frame_exclusivity
+from app.timestamps import synchronize_project_cameras
 from app.vision import VisionModels
 
 
@@ -47,6 +49,7 @@ def default_project() -> Dict:
         "zones": [],
         "cameras": [],
         "cameraLinks": [],
+        "manualMarks": [],
         "staff": [],
         "managerSettings": {
             "greetingTargetSeconds": 90,
@@ -87,8 +90,13 @@ class ProjectStore:
             for camera in project.get("cameras", []):
                 camera.setdefault("calibration", [])
                 camera["calibrationQuality"] = calibration_quality(camera)
+                for key in ("videoPath", "previewPath"):
+                    if camera.get(key):
+                        camera[key] = str(camera[key]).replace("\\", "/")
             for person in project.get("staff", []):
                 person.setdefault("role", "waiter")
+                if person.get("photoPath"):
+                    person["photoPath"] = str(person["photoPath"]).replace("\\", "/")
             for key, value in defaults["managerSettings"].items():
                 project["managerSettings"].setdefault(key, value)
             return project
@@ -137,7 +145,7 @@ def preserve_staff_embeddings(incoming: Dict, stored: Dict) -> Dict:
 
 
 def relative_to_root(path: Path) -> str:
-    return str(path.resolve().relative_to(ROOT.resolve()))
+    return path.resolve().relative_to(ROOT.resolve()).as_posix()
 
 
 def calibration_quality(camera: Dict) -> Dict:
@@ -360,6 +368,11 @@ class TaskStore:
 
 
 def rebuilt_results(project: Dict, previous: Dict) -> Dict:
+    frame_repairs = enforce_same_frame_exclusivity(previous.get("observations", []))
+    if frame_repairs["count"]:
+        consistency = previous.setdefault("identityConsistency", {})
+        consistency["sameFrameIdentitiesSplit"] = int(consistency.get("sameFrameIdentitiesSplit", 0)) + frame_repairs["count"]
+        consistency["examples"] = (consistency.get("examples", []) + frame_repairs["examples"])[:100]
     analyzer = VideoAnalyzer.__new__(VideoAnalyzer)
     analyzer.project = project
     analyzer.sample_fps = max(0.5, min(float(project.get("settings", {}).get("sampleFps", 3)), 10.0))
@@ -371,6 +384,9 @@ def rebuilt_results(project: Dict, previous: Dict) -> Dict:
     rebuilt["runId"] = previous.get("runId")
     rebuilt["sourceGeneratedAt"] = previous.get("sourceGeneratedAt", previous.get("generatedAt"))
     rebuilt["corrections"] = previous.get("corrections", [])
+    for key in ("timestampSync", "spatialSync", "autoCalibration", "identityConsistency", "runtime"):
+        if key in previous:
+            rebuilt[key] = previous[key]
     return rebuilt
 
 
@@ -531,6 +547,14 @@ class RestaurantVisionHandler(BaseHTTPRequestHandler):
                 return self.remove_item()
             if route.path == "/api/analyze":
                 return self.start_analysis()
+            if route.path == "/api/timestamps/sync":
+                project = ProjectStore.load()
+                report = synchronize_project_cameras(ROOT, project)
+                if report.get("status") == "verified":
+                    if report.get("applied"):
+                        project["timestampSyncUpdatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    ProjectStore.save(project)
+                return self.send_json({"project": public_project(project), "timestampSync": report})
             if route.path == "/api/corrections":
                 return self.correct_results()
             if route.path == "/api/tasks":
@@ -620,26 +644,26 @@ class RestaurantVisionHandler(BaseHTTPRequestHandler):
         name = self.field_text(form, "name").strip()
         if not name:
             raise ValueError("Enter the staff member's name")
-        if upload is None or not getattr(upload, "file", None):
-            raise ValueError("Choose a clear staff photo")
-        payload = upload.file.read()
-        image = cv2.imdecode(__import__("numpy").frombuffer(payload, dtype="uint8"), cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError("The staff photo could not be read")
-        models = VisionModels(ROOT / "models")
-        embedding = models.embedding_from_image(image)
         staff_id = uuid.uuid4().hex[:10]
         role = self.field_text(form, "role", "waiter").strip().lower()
         if role not in TaskStore.roles:
             raise ValueError("Choose a valid staff role")
-        suffix = Path(upload.filename or "staff.jpg").suffix.lower()
-        if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
-            suffix = ".jpg"
-        photo_path = DATA_DIR / "staff" / f"{staff_id}{suffix}"
-        photo_path.parent.mkdir(parents=True, exist_ok=True)
-        with photo_path.open("wb") as handle:
-            handle.write(payload)
-        entry = {"id": staff_id, "name": name, "role": role, "embedding": embedding, "photoPath": relative_to_root(photo_path)}
+        entry = {"id": staff_id, "name": name, "role": role, "embedding": None, "photoPath": None}
+        if upload is not None and getattr(upload, "file", None) and upload.filename:
+            payload = upload.file.read()
+            image = cv2.imdecode(__import__("numpy").frombuffer(payload, dtype="uint8"), cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError("The staff photo could not be read")
+            models = VisionModels(ROOT / "models")
+            entry["embedding"] = models.embedding_from_image(image)
+            suffix = Path(upload.filename or "staff.jpg").suffix.lower()
+            if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+                suffix = ".jpg"
+            photo_path = DATA_DIR / "staff" / f"{staff_id}{suffix}"
+            photo_path.parent.mkdir(parents=True, exist_ok=True)
+            with photo_path.open("wb") as handle:
+                handle.write(payload)
+            entry["photoPath"] = relative_to_root(photo_path)
         project = ProjectStore.load()
         project["staff"].append(entry)
         ProjectStore.save(project)
@@ -663,6 +687,13 @@ class RestaurantVisionHandler(BaseHTTPRequestHandler):
                 link for link in project.get("cameraLinks", [])
                 if link.get("fromCameraId") != item_id and link.get("toCameraId") != item_id
             ]
+            project["manualMarks"] = [mark for mark in project.get("manualMarks", []) if mark.get("cameraId") != item_id]
+        elif item_type == "staff":
+            project["manualMarks"] = [mark for mark in project.get("manualMarks", []) if mark.get("staffId") != item_id]
+        elif item_type == "table":
+            for mark in project.get("manualMarks", []):
+                if mark.get("tableId") == item_id:
+                    mark["tableId"] = None
         elif item_type == "zone":
             for link in project.get("cameraLinks", []):
                 if link.get("exitZoneId") == item_id:
@@ -691,16 +722,24 @@ class RestaurantVisionHandler(BaseHTTPRequestHandler):
                     job.update({"status": "running", "progress": round(progress, 4), "message": message})
 
             try:
+                report(0.0, "Reading embedded camera timestamps")
+                timestamp_report = synchronize_project_cameras(ROOT, project)
+                if timestamp_report.get("status") == "verified":
+                    if timestamp_report.get("applied"):
+                        project["timestampSyncUpdatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    ProjectStore.save(project)
                 analyzer = VideoAnalyzer(ROOT, project)
                 results = analyzer.analyze(report)
+                results["timestampSync"] = timestamp_report
                 run_id = f"run-{time.strftime('%Y%m%d-%H%M%S', time.localtime())}-{job_id[:5]}"
                 results["runId"] = run_id
                 results["corrections"] = []
                 save_json_atomic(RESULTS_PATH, results)
                 save_json_atomic(RUNS_DIR / f"{run_id}.json", results)
                 task_count = TaskStore.generate_for_run(results, project)
+                backend = results.get("runtime", {}).get("personDetector", "CPU")
                 with JOBS_LOCK:
-                    job.update({"status": "complete", "progress": 1.0, "message": f"Analysis complete · {task_count} actions prepared"})
+                    job.update({"status": "complete", "progress": 1.0, "message": f"Analysis complete on {backend} · {task_count} actions prepared"})
             except Exception as error:
                 traceback.print_exc()
                 with JOBS_LOCK:
@@ -794,7 +833,10 @@ class RestaurantVisionHandler(BaseHTTPRequestHandler):
         return self.send_file(ROOT / camera["previewPath"], cache=False)
 
     def send_media(self, relative: str) -> None:
-        candidate = (DATA_DIR / unquote(relative)).resolve()
+        rel = unquote(relative).replace("\\", "/")
+        if rel.startswith("data/"):
+            rel = rel[len("data/") :]
+        candidate = (DATA_DIR / rel).resolve()
         if DATA_DIR.resolve() not in candidate.parents or not candidate.is_file():
             return self.send_json({"error": "Media not found"}, HTTPStatus.NOT_FOUND)
         return self.send_file(candidate, cache=True)
@@ -838,10 +880,7 @@ class RestaurantVisionHandler(BaseHTTPRequestHandler):
                 chunk = handle.read(min(1024 * 1024, remaining))
                 if not chunk:
                     break
-                try:
-                    self.wfile.write(chunk)
-                except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
-                    break
+                self.wfile.write(chunk)
                 remaining -= len(chunk)
 
     def send_json(self, value: Dict, status: HTTPStatus = HTTPStatus.OK) -> None:
@@ -869,6 +908,45 @@ class RestaurantVisionHandler(BaseHTTPRequestHandler):
         if len(project["cameras"]) > 32 or len(project["cameraLinks"]) > 128 or len(project["tables"]) > 200 or len(project["zones"]) > 500:
             raise ValueError("Project exceeds the prototype limit")
         camera_ids = {camera.get("id") for camera in project["cameras"]}
+        camera_by_id = {camera.get("id"): camera for camera in project["cameras"]}
+        for camera in project["cameras"]:
+            try:
+                offset = float(camera.get("timeOffsetSeconds", 0))
+                adjustment = float(camera.get("manualTimeAdjustmentSeconds", 0))
+            except (TypeError, ValueError):
+                raise ValueError("Camera time adjustments must be numeric")
+            if not math.isfinite(offset) or not math.isfinite(adjustment) or abs(adjustment) > 30:
+                raise ValueError("Camera time adjustments must be within 30 seconds")
+        staff_ids = {person.get("id") for person in project["staff"]}
+        table_ids = {table.get("id") for table in project["tables"]}
+        marks = project.get("manualMarks", [])
+        if not isinstance(marks, list) or len(marks) > 1000:
+            raise ValueError("Too many manual person markings")
+        mark_ids = set()
+        for mark in marks:
+            if not isinstance(mark, dict) or not isinstance(mark.get("id"), str) or not mark["id"] or mark["id"] in mark_ids:
+                raise ValueError("Manual person markings need unique IDs")
+            mark_ids.add(mark["id"])
+            camera = camera_by_id.get(mark.get("cameraId"))
+            if camera is None:
+                raise ValueError("A manual marking references a missing camera")
+            if mark.get("role") not in {"customer", "staff"}:
+                raise ValueError("A manual marking must be customer or staff")
+            if mark["role"] == "staff" and mark.get("staffId") not in staff_ids:
+                raise ValueError("Choose an enrolled staff actor for staff markings")
+            if mark.get("tableId") and mark["tableId"] not in table_ids:
+                raise ValueError("A manual marking references a missing table")
+            box = mark.get("bbox")
+            if not isinstance(box, list) or len(box) != 4:
+                raise ValueError("Draw a person box before saving a manual marking")
+            try:
+                x, y, width, height = [float(value) for value in box]
+                start, end = float(mark["startSeconds"]), float(mark["endSeconds"])
+            except (TypeError, ValueError, KeyError):
+                raise ValueError("Manual marking position and time must be numeric")
+            duration = float(camera.get("metadata", {}).get("durationSeconds") or 0)
+            if not all(map(math.isfinite, (x, y, width, height, start, end))) or x < 0 or y < 0 or width < .005 or height < .005 or x + width > 1.001 or y + height > 1.001 or start < 0 or end <= start or (duration and end > duration + 0.5):
+                raise ValueError("Manual marking box or time is outside the camera recording")
         zone_ids = {zone.get("id") for zone in project["zones"]}
         for link in project["cameraLinks"]:
             if link.get("fromCameraId") not in camera_ids or link.get("toCameraId") not in camera_ids:

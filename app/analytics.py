@@ -7,11 +7,15 @@ import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
+from statistics import median
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import cv2
 
-from .geometry import average_embeddings, containing_zones, cosine_similarity, homography_from_calibration, nearest_table, project_point
+from .geometry import average_embeddings, bbox_iou, containing_zones, cosine_similarity, homography_from_calibration, nearest_table, project_point
+from .consistency import autocorrect_camera_maps, deduplicate_same_frame, enforce_exclusive_identity
+from .presence import SeatedPresence
+from .spatial_sync import refine_spatial_time
 from .tracking import ByteTracker, Track, optimal_assignment
 from .vision import VisionModels
 
@@ -40,8 +44,14 @@ class IdentityBank:
                     return f"staff:{entry['id']}", "staff", score
 
             if current_id and current_id.startswith("customer:"):
-                self.customers.setdefault(current_id, []).append(list(embedding))
-                return current_id, "customer", 1.0
+                samples = self.customers.setdefault(current_id, [])
+                score = cosine_similarity(embedding, average_embeddings(samples)) if samples else 1.0
+                # A local tracker can switch people during an occlusion. Do not
+                # contaminate the customer's reference features with a mismatch.
+                if score >= self.customer_threshold:
+                    samples.append(list(embedding))
+                    self.customers[current_id] = samples[-20:]
+                return current_id, "customer", score
 
             candidates = [
                 (cosine_similarity(embedding, average_embeddings(samples)), identity)
@@ -80,6 +90,61 @@ class VideoAnalyzer:
             float(settings.get("staffFaceThreshold", 0.42)),
         )
 
+    @staticmethod
+    def _apply_manual_marks(
+        observations: List[Dict], marks: List[Dict], camera: Dict, timestamp: float,
+        width: int, height: int, homography, tables: List[Dict], zones: List[Dict], table_radius: float,
+    ) -> None:
+        """Use a bounded human assertion where detection is missing or mislabelled."""
+        local_time = timestamp - float(camera.get("timeOffsetSeconds", 0))
+        active = [mark for mark in marks if float(mark["startSeconds"]) - 1e-3 <= local_time <= float(mark["endSeconds"]) + 1e-3]
+        claimed = set()
+        table_by_id = {table["id"]: table for table in tables}
+        for mark in active:
+            mx, my, mw, mh = mark["bbox"]
+            selected = None
+            best = 0.0
+            for index, observation in enumerate(observations):
+                if index in claimed:
+                    continue
+                ox, oy, ow, oh = observation["bbox"]
+                overlap = bbox_iou([mx, my, mw, mh], [ox, oy, ow, oh])
+                center_inside = mx <= ox + ow / 2 <= mx + mw and my <= oy + oh / 2 <= my + mh
+                score = overlap + (0.12 if center_inside else 0.0)
+                if score > best and (overlap >= 0.08 or center_inside and overlap >= 0.025):
+                    selected, best = index, score
+
+            identity = f"staff:{mark['staffId']}" if mark["role"] == "staff" else f"customer:manual:{mark['id']}"
+            table_id = mark.get("tableId")
+            if selected is not None:
+                claimed.add(selected)
+                observation = observations[selected]
+                observation.update(globalId=identity, role=mark["role"], identityConfidence=1.0,
+                                   manualMarkId=mark["id"], source="manual-assisted")
+                if table_id:
+                    observation["tableId"] = table_id
+                continue
+
+            table = table_by_id.get(table_id)
+            if table:
+                point = (float(table["x"]) + float(table["w"]) / 2,
+                         float(table["y"]) + float(table["h"]) / 2)
+            else:
+                point = project_point(((mx + mw / 2) * width, (my + mh) * height), homography)
+                if not table_id:
+                    nearest = nearest_table(point, tables, table_radius, zones)
+                    table_id = nearest["id"] if nearest else None
+            observations.append({
+                "cameraId": camera["id"], "localId": f"manual:{mark['id']}",
+                "time": round(timestamp, 3), "globalId": identity, "role": mark["role"],
+                "bbox": [round(value, 5) for value in mark["bbox"]],
+                "map": [round(value, 5) for value in point] if point else None,
+                "tableId": table_id,
+                "zoneIds": [zone["id"] for zone in containing_zones(point, zones)],
+                "confidence": 0.0, "identityConfidence": 1.0,
+                "manualMarkId": mark["id"], "source": "manual",
+            })
+
     def analyze(self, progress: Optional[ProgressCallback] = None) -> Dict:
         progress = progress or (lambda value, message: None)
         cameras = [camera for camera in self.project.get("cameras", []) if camera.get("videoPath")]
@@ -100,10 +165,26 @@ class VideoAnalyzer:
             observations.extend(camera_observations)
             tracklets.extend(camera_tracklets)
 
+        progress(0.90, "Checking shared movement and camera timing")
+        observations, duplicate_issues = deduplicate_same_frame(observations)
+        spatial_sync = refine_spatial_time(observations, tracklets, self.project)
+        auto_calibration = autocorrect_camera_maps(observations, tracklets, self.project)
+        impossible_before = enforce_exclusive_identity(observations)
         progress(0.92, "Joining people as they move between camera views")
         observations, tracklets, handoffs = self._link_cross_camera(observations, tracklets)
+        impossible_after = enforce_exclusive_identity(observations)
+        for observation in observations:
+            observation.pop("localId", None)
         progress(0.96, "Calculating table and service metrics")
         results = self._build_results(observations, tracklets, handoffs)
+        results["autoCalibration"] = auto_calibration
+        results["spatialSync"] = spatial_sync
+        results["identityConsistency"] = {
+            "duplicateBoxesRemoved": len(duplicate_issues),
+            "impossiblePositionsFlagged": impossible_before["count"] + impossible_after["count"],
+            "examples": (duplicate_issues + impossible_before["examples"] + impossible_after["examples"])[:100],
+        }
+        results["runtime"] = self.models.runtime_info()
         progress(1.0, "Analysis complete")
         return results
 
@@ -119,6 +200,7 @@ class VideoAnalyzer:
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
         step = max(1, round(fps / self.sample_fps))
         tracker = ByteTracker(max_missing=max(3, round(self.sample_fps * 2.5)))
+        seated_presence = SeatedPresence(camera["id"])
         homography = homography_from_calibration(camera.get("calibration", []), width, height)
         observations: List[Dict] = []
         completed_tracklets: List[Track] = []
@@ -126,6 +208,7 @@ class VideoAnalyzer:
         tables = self.project.get("tables", [])
         zones = self.project.get("zones", [])
         table_radius = float(self.project.get("settings", {}).get("tableRadius", 0.075))
+        marks = [mark for mark in self.project.get("manualMarks", []) if mark.get("cameraId") == camera["id"]]
 
         frame_index = 0
         sampled = 0
@@ -140,9 +223,10 @@ class VideoAnalyzer:
             if not ok:
                 break
             timestamp = offset + frame_index / fps
-            detections = self.models.detections(frame)
+            detections = self.models.detections(frame, frame_index=sampled)
             active, ended = tracker.update(detections, timestamp, frame.shape)
             completed_tracklets.extend(ended)
+            frame_start = len(observations)
 
             for track in active:
                 embedding = track.embedding
@@ -184,6 +268,17 @@ class VideoAnalyzer:
                     }
                 )
 
+            if marks:
+                frame_observations = observations[-len(active):] if active else []
+                self._apply_manual_marks(frame_observations, marks, camera, timestamp, width, height,
+                                         homography, tables, zones, table_radius)
+                if active:
+                    observations[-len(active):] = frame_observations
+                else:
+                    observations.extend(frame_observations)
+
+            observations.extend(seated_presence.update(frame, observations[frame_start:], timestamp))
+
             sampled += 1
             if sampled % 10 == 0:
                 fraction = min(frame_index / max(frame_count, 1), 0.99)
@@ -196,7 +291,7 @@ class VideoAnalyzer:
         final_tracks = {track.local_id: track for track in completed_tracklets}
         for observation in observations:
             track = final_tracks.get(observation["localId"])
-            if track and track.global_id:
+            if track and track.global_id and not observation.get("manualMarkId"):
                 observation["globalId"] = track.global_id
                 observation["role"] = track.role
         progress(1.0, f"Finished {camera.get('name', camera['id'])}")
@@ -275,7 +370,7 @@ class VideoAnalyzer:
             for target_point in target.get("pathSamples", []):
                 if abs(float(source_point[0]) - float(target_point[0])) <= tolerance:
                     distances.append(math.hypot(source_point[1] - target_point[1], source_point[2] - target_point[2]))
-        return min(distances) if distances else None
+        return median(distances) if distances else None
 
     def _link_cross_camera(self, observations: List[Dict], tracklets: List[Dict]) -> Tuple[List[Dict], List[Dict], List[Dict]]:
         settings = self.project.get("settings", {})
@@ -285,8 +380,6 @@ class VideoAnalyzer:
             if track.get("globalId") and track.get("startMap") and track.get("endMap")
         ]
         if not tracks:
-            for observation in observations:
-                observation.pop("localId", None)
             return observations, tracklets, []
 
         handoff_zone_ids = {
@@ -345,9 +438,14 @@ class VideoAnalyzer:
                 target_staff = str(target["globalId"]).startswith("staff:")
                 if source_staff and target_staff and source["globalId"] != target["globalId"]:
                     continue
-                if source_staff != target_staff and not (face_support or body_support):
-                    # Never turn an anonymous guest into a staff identity from
-                    # route proximity alone.
+                if source_staff != target_staff:
+                    # A cross-camera appearance match must not relabel a guest
+                    # as an enrolled employee (or the reverse). Such cases
+                    # need an explicit human identity correction.
+                    continue
+                if mode == "overlap" and distance > route["maxDistance"] * 1.5:
+                    # Similar faces cannot put one person in two distant map
+                    # positions at the same instant.
                     continue
                 if not (face_support or body_support or layout_support or shared_handoff_zone or route_zone_support):
                     continue
@@ -450,7 +548,6 @@ class VideoAnalyzer:
             observation["globalId"] = remap.get(observation["globalId"], observation["globalId"])
             if observation["globalId"].startswith("staff:"):
                 observation["role"] = "staff"
-            observation.pop("localId", None)
         for track in tracklets:
             track["globalId"] = remap.get(track.get("globalId"), track.get("globalId"))
             if str(track.get("globalId", "")).startswith("staff:"):
@@ -486,6 +583,8 @@ class VideoAnalyzer:
             if not table_id:
                 continue
             bucket = int(round(observation["time"] / interval))
+            if observation["role"] not in {"staff", "customer"}:
+                continue
             group = "staff" if observation["role"] == "staff" else "customers"
             buckets[table_id][bucket][group].add(identity)
 
@@ -563,13 +662,13 @@ class VideoAnalyzer:
                 }
             )
 
-        customer_ids = {observation["globalId"] for observation in observations if observation["role"] != "staff"}
+        customer_ids = {observation["globalId"] for observation in observations if observation["role"] == "customer"}
         first_service_values = [session["firstServiceSeconds"] for session in sessions_all if session["firstServiceSeconds"] is not None]
         served_sessions = [session for session in sessions_all if session["staffVisits"] > 0]
         mapped_observations = sum(1 for observation in observations if observation.get("map"))
         average_detection_confidence = (
-            sum(float(observation.get("confidence", 0)) for observation in observations) / len(observations)
-            if observations else 0.0
+            sum(float(observation.get("confidence", 0)) for observation in observations if not observation.get("estimated") and observation.get("source") != "manual")
+            / max(1, sum(1 for observation in observations if not observation.get("estimated") and observation.get("source") != "manual"))
         )
         return {
             "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -578,6 +677,9 @@ class VideoAnalyzer:
                 "staffDetected": len(staff_rows),
                 "tableSessions": len(sessions_all),
                 "observations": len(observations),
+                "manualObservations": sum(1 for observation in observations if observation.get("manualMarkId")),
+                "estimatedSeatedObservations": sum(1 for observation in observations if observation.get("estimated")),
+                "observationsNeedingIdentityReview": sum(1 for observation in observations if observation.get("role") == "unresolved"),
                 "camerasAnalyzed": len({observation["cameraId"] for observation in observations}),
                 "occupiedMinutes": round(sum(session["durationSeconds"] for session in sessions_all) / 60.0, 2),
                 "staffVisits": sum(session["staffVisits"] for session in sessions_all),
@@ -610,9 +712,13 @@ class VideoAnalyzer:
                 "Customer identities are temporary clusters strengthened by whole-body ReID and occasional face evidence; biometric vectors are not retained in results.",
                 "Camera points are projected onto the shared floor plan using manual calibration.",
                 "Within-camera tracks use high-confidence association followed by low-confidence occlusion recovery.",
+                "Seated customer positions may persist through missed detections while the camera view remains visually consistent; these observations are estimated and end after visual change or observed departure.",
+                "On-screen timestamps establish the camera clock baseline. Shared movement can refine an offset only when two independent moving staff identities provide a clear match.",
                 "Cross-camera handoffs use a global assignment across configured camera routes, travel windows, zones, body appearance, face evidence and floor position.",
                 "First service means the first detected staff presence near an occupied table.",
                 "All metrics should be reviewed against the linked footage during calibration.",
+                "Manual markings are time-bounded human assertions. They can fill detection gaps but must end when the person leaves; they are not proof of continuous visual tracking.",
+                "Distinct people in one camera frame cannot share an identity. Conflicting customer boxes receive separate provisional IDs; conflicting staff matches are withheld from staff metrics pending review. Strong multi-person overlap evidence may translate a camera's analysis map but never silently rewrites calibration points.",
             ],
         }
 

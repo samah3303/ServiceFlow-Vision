@@ -18,6 +18,10 @@ const state = {
   reviewBaseTime: 0,
   reviewFrame: null,
   reviewIndex: new Map(),
+  selectedReviewObservation: null,
+  manualCameraId: null,
+  manualBox: null,
+  manualDrag: null,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -49,7 +53,7 @@ function toast(message, isError = false) {
 
 function mediaUrl(path) {
   if (!path) return "";
-  const normalized = path.replace(/\\/g, "/");
+  const normalized = String(path).replace(/\\/g, "/");
   return `/media/${normalized.startsWith("data/") ? normalized.slice(5) : normalized}`;
 }
 
@@ -261,16 +265,10 @@ function renderTables() {
       <button class="icon-button" aria-label="Remove table">×</button>
     </div>`).join("");
   $$(".table-item", list).forEach(row => {
-    $("input", row).addEventListener("change", event => { 
-      const currentTable = state.project.tables.find(item => item.id === row.dataset.id);
-      if (currentTable) {
-        currentTable.number = event.target.value.trim() || currentTable.number; 
-        saveProject(); 
-        drawLayoutEditor(); 
-      }
-    });
+    const table = tables.find(item => item.id === row.dataset.id);
+    $("input", row).addEventListener("change", event => { table.number = event.target.value.trim() || table.number; saveProject(); drawLayoutEditor(); });
     $("button", row).addEventListener("click", async () => {
-      state.project = await api("/api/remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "table", id: row.dataset.id }) });
+      state.project = await api("/api/remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "table", id: table.id }) });
       renderAll();
     });
   });
@@ -324,7 +322,19 @@ function renderCameras() {
     });
   }
   renderCalibrationSelector();
+  renderManualMarks();
+  renderCameraClocks();
   renderCameraLinks();
+}
+
+function renderCameraClocks() {
+  const cameras = state.project.cameras || [];
+  $("#syncTimestampsButton").disabled = cameras.length < 2;
+  $("#timestampSyncList").innerHTML = cameras.length ? cameras.map(camera => {
+    const sync = camera.timestampSync || {};
+    const status = sync.status === "verified" ? `Verified from ${sync.samples} readings · ${escapeHTML(sync.startTime || "")}` : sync.reason || "Not checked yet";
+    return `<div class="clock-item"><strong>${escapeHTML(camera.name)}</strong><span>${escapeHTML(status)} · effective offset ${Number(camera.timeOffsetSeconds || 0).toFixed(2)}s</span><label>Manual fine shift, seconds<input type="number" min="-30" max="30" step="0.25" value="${Number(camera.manualTimeAdjustmentSeconds || 0)}" data-clock-adjust-camera="${escapeHTML(camera.id)}" /></label></div>`;
+  }).join("") : `<div class="audit-empty">Add recordings to compare their clocks.</div>`;
 }
 
 function renderCameraLinks() {
@@ -411,13 +421,78 @@ function renderCalibrationPoints() {
   else $("#calibrationInstruction").textContent = `${points.length} points matched · ${camera.calibrationQuality?.label || "ready"} calibration (${camera.calibrationQuality?.score ?? "—"}/100). Add spread-out points to improve it.`;
 }
 
+function manualCamera() { return state.project.cameras.find(camera => camera.id === state.manualCameraId); }
+
+function renderManualMarks() {
+  const cameras = state.project.cameras || [];
+  if (!cameras.some(camera => camera.id === state.manualCameraId)) state.manualCameraId = state.selectedCameraId || cameras[0]?.id || null;
+  const select = $("#manualCameraSelect");
+  select.innerHTML = cameras.map(camera => `<option value="${camera.id}">${escapeHTML(camera.name)}</option>`).join("") || `<option value="">Add a camera first</option>`;
+  select.value = state.manualCameraId || "";
+  select.disabled = !cameras.length;
+  const camera = manualCamera();
+  const video = $("#manualVideo");
+  const canvas = $("#manualCanvas");
+  canvas.width = Number(camera?.metadata?.width || 800);
+  canvas.height = Number(camera?.metadata?.height || 450);
+  $("#manualVideoWrap").style.aspectRatio = `${canvas.width} / ${canvas.height}`;
+  const source = camera?.videoPath ? mediaUrl(camera.videoPath) : "";
+  if (video.getAttribute("src") !== source) {
+    video.pause();
+    if (source) video.setAttribute("src", source); else video.removeAttribute("src");
+    video.load();
+    state.manualBox = null;
+  }
+  const duration = Number(camera?.metadata?.durationSeconds || 0);
+  $("#manualTimeline").max = duration || 1;
+  $("#manualDuration").textContent = formatClock(duration);
+  if (!camera) $("#manualDrawStatus").textContent = "Add a camera recording first.";
+  $("#manualStaff").innerHTML = state.project.staff.map(person => `<option value="${person.id}">${escapeHTML(person.name)}</option>`).join("") || `<option value="">Enroll staff first</option>`;
+  $("#manualTable").innerHTML = `<option value="">No table / use floor position</option>` + state.project.tables.map(table => `<option value="${table.id}">Table ${escapeHTML(table.number)}</option>`).join("");
+  const marks = (state.project.manualMarks || []).filter(mark => mark.cameraId === state.manualCameraId);
+  $("#manualCountBadge").textContent = marks.length;
+  const list = $("#manualMarkList");
+  list.className = `manual-mark-list${marks.length ? "" : " empty-list"}`;
+  list.innerHTML = marks.length ? marks.sort((a, b) => a.startSeconds - b.startSeconds).map(mark => {
+    const staff = state.project.staff.find(person => person.id === mark.staffId);
+    const table = state.project.tables.find(item => item.id === mark.tableId);
+    const label = mark.role === "staff" ? staff?.name || "Staff" : "Customer";
+    return `<div class="manual-mark-item" data-id="${escapeHTML(mark.id)}"><div><strong>${escapeHTML(label)}</strong><span>${formatClock(mark.startSeconds)}–${formatClock(mark.endSeconds)}${table ? ` · Table ${escapeHTML(table.number)}` : ""}</span></div><button class="icon-button" type="button" aria-label="Remove marking">×</button></div>`;
+  }).join("") : "No people marked for this camera.";
+  $$(".manual-mark-item button", list).forEach(button => button.addEventListener("click", async () => {
+    const id = button.closest(".manual-mark-item").dataset.id;
+    state.project.manualMarks = state.project.manualMarks.filter(mark => mark.id !== id);
+    await saveProject(true); renderManualMarks(); drawManualCanvas();
+  }));
+  drawManualCanvas();
+}
+
+function drawManualCanvas() {
+  const canvas = $("#manualCanvas"), ctx = canvas.getContext("2d"), video = $("#manualVideo");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const current = video.currentTime || 0;
+  const marks = (state.project?.manualMarks || []).filter(mark => mark.cameraId === state.manualCameraId && current >= mark.startSeconds && current <= mark.endSeconds);
+  for (const mark of marks) {
+    const [x, y, w, h] = mark.bbox;
+    ctx.strokeStyle = mark.role === "staff" ? "#ff745e" : "#55d48b";
+    ctx.lineWidth = Math.max(2, canvas.width / 300); ctx.setLineDash([]);
+    ctx.strokeRect(x * canvas.width, y * canvas.height, w * canvas.width, h * canvas.height);
+  }
+  const box = state.manualDrag ? [Math.min(state.manualDrag.start.x, state.manualDrag.end.x), Math.min(state.manualDrag.start.y, state.manualDrag.end.y), Math.abs(state.manualDrag.end.x - state.manualDrag.start.x), Math.abs(state.manualDrag.end.y - state.manualDrag.start.y)] : state.manualBox;
+  if (box) {
+    ctx.strokeStyle = "#f9d978"; ctx.lineWidth = Math.max(2, canvas.width / 250); ctx.setLineDash([8, 5]);
+    ctx.strokeRect(box[0] * canvas.width, box[1] * canvas.height, box[2] * canvas.width, box[3] * canvas.height);
+    ctx.setLineDash([]);
+  }
+}
+
 function renderStaff() {
   const list = $("#staffList");
   const staff = state.project.staff;
   $("#staffCountBadge").textContent = staff.length;
   if (!staff.length) { list.className = "people-list empty-list"; list.textContent = "No staff profiles yet"; return; }
   list.className = "people-list";
-  list.innerHTML = staff.map(person => `<div class="person-item" data-id="${person.id}"><div class="person-avatar"><img src="${mediaUrl(person.photoPath)}" alt="${escapeHTML(person.name)}" /></div><div class="person-copy"><strong>${escapeHTML(person.name)}</strong><small>${escapeHTML((person.role || "waiter").replace(/^./, value => value.toUpperCase()))} · face profile ready</small></div><button class="icon-button" aria-label="Remove staff profile">×</button></div>`).join("");
+  list.innerHTML = staff.map(person => `<div class="person-item" data-id="${person.id}"><div class="person-avatar">${person.photoPath ? `<img src="${mediaUrl(person.photoPath)}" alt="${escapeHTML(person.name)}" />` : escapeHTML(person.name.slice(0, 1).toUpperCase())}</div><div class="person-copy"><strong>${escapeHTML(person.name)}</strong><small>${escapeHTML((person.role || "waiter").replace(/^./, value => value.toUpperCase()))} · ${person.photoPath ? "face profile ready" : "video-only; identify in Review"}</small></div><button class="icon-button" aria-label="Remove staff profile">×</button></div>`).join("");
   $$(".person-item", list).forEach(row => $("button", row).addEventListener("click", async () => {
     if (!confirm("Remove this staff profile?")) return;
     state.project = await api("/api/remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "staff", id: row.dataset.id }) });
@@ -461,15 +536,40 @@ function renderReports() {
   $("#reportContent").hidden = !results;
   $("#exportButton").disabled = !results;
   if (!results) return;
-  $("#reportGenerated").textContent = `Generated locally ${new Date(results.generatedAt).toLocaleString()}`;
+  const oldOffsets = new Map((results.timestampSync?.cameras || []).map(row => [row.cameraId, row.offsetSeconds]));
+  const offsetsChanged = [...oldOffsets].some(([id, offset]) => offset != null && Math.abs(Number(state.project.cameras.find(camera => camera.id === id)?.timeOffsetSeconds || 0) - Number(offset)) > .1);
+  const syncNewerThanReport = resultTimingIsStale();
+  const reviewCount = Number(results.summary?.observationsNeedingIdentityReview || 0);
+  $("#reportGenerated").textContent = `Generated locally ${new Date(results.generatedAt).toLocaleString()}${offsetsChanged || syncNewerThanReport ? " · Camera offsets changed; rerun analysis" : ""}${reviewCount ? ` · ${reviewCount.toLocaleString()} observations need identity review` : ""}`;
   const summary = results.summary;
   const metrics = [
     ["Anonymous customers", summary.customers, "Temporary identities"],
     ["Staff detected", summary.staffDetected, "Enrolled profiles matched"],
     ["Table sessions", summary.tableSessions, "Observed occupied periods"],
-    ["Camera views", summary.camerasAnalyzed, `${summary.observations.toLocaleString()} observations`],
+    ["Camera views", summary.camerasAnalyzed, `${summary.observations.toLocaleString()} observations${summary.manualObservations ? ` · ${summary.manualObservations.toLocaleString()} human-assisted` : ""}${summary.estimatedSeatedObservations ? ` · ${summary.estimatedSeatedObservations.toLocaleString()} estimated seated` : ""}`],
   ];
   $("#reportMetrics").innerHTML = metrics.map(([label, value, note], index) => `<article class="metric-card ${index === 3 ? "accent-card" : ""}"><span>${label}</span><strong>${value}</strong><small>${note}</small></article>`).join("");
+  const calibration = results.autoCalibration?.cameras || [];
+  const calibrationMessages = {
+    reference: "Reference camera",
+    corrected: "Small map shift applied for this analysis",
+    aligned: "Map positions already agree",
+    "insufficient-evidence": "Not enough independent staff matches to adjust safely",
+    "conflicting-evidence": "Matches disagree; check calibration points",
+    "large-error-needs-review": "Possible large error; manual calibration review needed",
+  };
+  const clockRefinement = results.spatialSync?.cameras || [];
+  const clockMessages = { reference: "Reference clock", aligned: "Shared movement agrees with the clock",
+    corrected: "Shared movement refined playback by", "insufficient-movement": "Not enough moving staff to verify clock",
+    "insufficient-overlap": "Not enough shared movement to verify clock",
+    "ambiguous-needs-review": "Movement timing is ambiguous; clock left unchanged" };
+  $("#reportCalibration").innerHTML = calibration.length ? calibration.map(row => {
+    const name = state.project.cameras.find(camera => camera.id === row.cameraId)?.name || row.cameraId;
+    const shift = row.status === "corrected" ? ` (${row.shift.map(value => Number(value).toFixed(3)).join(", ")})` : "";
+    const clock = clockRefinement.find(item => item.cameraId === row.cameraId);
+    const clockText = clock ? `${clockMessages[clock.status] || clock.status}${clock.status === "corrected" ? ` ${Number(clock.adjustmentSeconds).toFixed(1)}s` : ""}` : "Clock refinement unavailable";
+    return `<div class="calibration-status-row"><strong>${escapeHTML(name)}</strong><span>${escapeHTML(clockText)} · ${escapeHTML(calibrationMessages[row.status] || row.status)}${shift}</span></div>`;
+  }).join("") : `<p>Rerun analysis to check the corrected camera clocks and floor-plan alignment.</p>`;
   $("#tableReport").innerHTML = results.tables.length ? results.tables.map(table => `<tr><td>${escapeHTML(table.tableNumber)}</td><td>${table.turns}</td><td>${table.occupiedMinutes} min</td><td>${table.averagePartySize}</td><td>${table.averageFirstServiceSeconds == null ? "Not observed" : `${table.averageFirstServiceSeconds}s`}</td><td>${table.staffVisits}</td></tr>`).join("") : `<tr><td colspan="6">No table sessions were detected.</td></tr>`;
   const maxVisits = Math.max(1, ...results.staff.map(person => person.tableVisits));
   $("#staffReport").innerHTML = results.staff.length ? results.staff.map(person => `<div class="staff-report-row"><strong>${escapeHTML(person.name)}</strong><span>${person.tableVisits} visits · ${person.interactionMinutes} min near tables · ${person.firstContacts} first contacts</span><div class="staff-bar"><div style="width:${(person.tableVisits / maxVisits) * 100}%"></div></div></div>`).join("") : `<div class="staff-report-row"><span>No enrolled staff were matched in this run.</span></div>`;
@@ -483,6 +583,9 @@ function identityLabel(identity) {
     const id = identity.split(":", 2)[1];
     return state.project.staff.find(person => person.id === id)?.name || `Staff ${id}`;
   }
+  if (identity.startsWith("customer:manual:")) return `Marked customer ${identity.slice(-4)}`;
+  if (identity.startsWith("customer:collision:")) return `Review customer ${identity.split(":").slice(-2).join("-")}`;
+  if (identity.startsWith("unresolved:")) return `Review identity ${identity.split(":").slice(-2).join("-")}`;
   return identity.replace("customer:", "Customer ").replace("pending:", "Pending ");
 }
 
@@ -499,9 +602,14 @@ function buildReviewIndex() {
 function observationsAt(cameraId, time) {
   const fps = Number(state.project.settings.sampleFps || 3);
   const bucket = Math.round(time * fps);
-  return [bucket - 1, bucket, bucket + 1]
+  const nearby = [bucket - 1, bucket, bucket + 1]
     .flatMap(value => state.reviewIndex.get(`${cameraId}:${value}`) || [])
     .filter(observation => Math.abs(observation.time - time) <= Math.max(.22, .7 / fps));
+  if (!nearby.length) return [];
+  const nearestTime = nearby.reduce((best, item) => Math.abs(item.time - time) < Math.abs(best - time) ? item.time : best, nearby[0].time);
+  // Show one sampled frame only. A tolerance can combine boxes from adjacent
+  // timestamps and falsely make one identity appear twice on the canvas.
+  return nearby.filter(observation => observation.time === nearestTime);
 }
 
 function renderReview() {
@@ -510,9 +618,10 @@ function renderReview() {
   $("#reviewContent").hidden = !available;
   $("#exportTrainingButton").disabled = !available;
   if (!available) return;
+  $("#reviewTimingWarning").hidden = !resultTimingIsStale();
   buildReviewIndex();
   const cameras = state.project.cameras.filter(camera => camera.videoPath);
-  state.reviewDuration = Math.max(0, ...cameras.map(camera => Number(camera.timeOffsetSeconds || 0) + Number(camera.metadata?.durationSeconds || 0)));
+  state.reviewDuration = Math.max(0, ...cameras.map(camera => effectiveCameraOffset(camera) + Number(camera.metadata?.durationSeconds || 0)));
   state.reviewTime = Math.min(state.reviewTime, state.reviewDuration);
   $("#reviewTimeline").max = state.reviewDuration || 1;
   $("#reviewTimeline").value = state.reviewTime;
@@ -522,13 +631,78 @@ function renderReview() {
   const signature = cameras.map(camera => camera.id).join(",");
   if (grid.dataset.signature !== signature) {
     grid.dataset.signature = signature;
-    grid.innerHTML = cameras.map(camera => `<div class="review-feed" data-camera-id="${camera.id}"><span class="feed-label">${escapeHTML(camera.name)}</span><video muted playsinline preload="auto" src="${mediaUrl(camera.videoPath)}?t=${Date.now()}" onloadeddata="this.currentTime=0.001"></video><canvas width="${camera.metadata?.width || 800}" height="${camera.metadata?.height || 450}"></canvas></div>`).join("") + `<div class="review-feed review-map-feed"><span class="feed-label">SHARED FLOOR PLAN</span><canvas id="reviewMapCanvas" width="1000" height="650"></canvas></div>`;
-    $$("video", grid).forEach(video => video.addEventListener("error", () => toast("A camera video could not be loaded", true)));
+    grid.innerHTML = cameras.map(camera => `<div class="review-feed" data-camera-id="${camera.id}"><span class="feed-label">${escapeHTML(camera.name)}</span><video muted playsinline preload="metadata" src="${mediaUrl(camera.videoPath)}"></video><canvas width="${camera.metadata?.width || 800}" height="${camera.metadata?.height || 450}"></canvas></div>`).join("") + `<div class="review-feed review-map-feed"><span class="feed-label">SHARED FLOOR PLAN</span><canvas id="reviewMapCanvas" width="1000" height="650"></canvas></div>`;
+    $$(".review-feed[data-camera-id]", grid).forEach(feed => {
+      const video = $("video", feed);
+      video.addEventListener("error", () => toast("A camera video could not be loaded", true));
+      video.addEventListener("seeked", () => { if (state.view === "review") drawReviewOverlays(); });
+      if (video.requestVideoFrameCallback) {
+        const presented = (_now, metadata) => {
+          video._presentedMediaTime = metadata.mediaTime;
+          if (state.view === "review" && !state.reviewPlaying) drawReviewOverlays();
+          video.requestVideoFrameCallback(presented);
+        };
+        video.requestVideoFrameCallback(presented);
+      }
+      $("canvas", feed).addEventListener("click", event => selectReviewBox(event, feed));
+    });
   }
   renderIdentityControls();
+  $("#reviewQuickStaff").innerHTML = state.project.staff.map(person => `<option value="${escapeHTML(person.id)}">${escapeHTML(person.name)}${person.photoPath ? "" : " · video-only"}</option>`).join("") || `<option value="">Add a staff actor first</option>`;
   renderHandoffs();
   renderCorrections();
+  renderReviewSelection();
   setReviewTime(state.reviewTime, true);
+}
+
+function effectiveCameraOffset(camera) {
+  const adjustment = resultTimingIsStale() ? 0 : state.results?.spatialSync?.cameras?.find(row => row.cameraId === camera.id)?.adjustmentSeconds || 0;
+  return Number(camera.timeOffsetSeconds || 0) + Number(adjustment);
+}
+
+function resultTimingIsStale() {
+  return Boolean(state.results && state.project.timestampSyncUpdatedAt
+    && new Date(state.project.timestampSyncUpdatedAt) > new Date(state.results.sourceGeneratedAt || state.results.generatedAt));
+}
+
+function displayedReviewTime(feed) {
+  const camera = state.project.cameras.find(item => item.id === feed.dataset.cameraId);
+  const video = $("video", feed);
+  return effectiveCameraOffset(camera) + Number(video._presentedMediaTime ?? video.currentTime ?? 0);
+}
+
+function selectReviewBox(event, feed) {
+  const canvas = $("canvas", feed);
+  const rect = canvas.getBoundingClientRect();
+  const scale = Math.min(rect.width / canvas.width, rect.height / canvas.height);
+  const drawnWidth = canvas.width * scale, drawnHeight = canvas.height * scale;
+  const x = (event.clientX - rect.left - (rect.width - drawnWidth) / 2) / drawnWidth;
+  const y = (event.clientY - rect.top - (rect.height - drawnHeight) / 2) / drawnHeight;
+  if (x < 0 || x > 1 || y < 0 || y > 1) return;
+  const matches = observationsAt(feed.dataset.cameraId, displayedReviewTime(feed))
+    .filter(row => x >= row.bbox[0] && x <= row.bbox[0] + row.bbox[2]
+      && y >= row.bbox[1] && y <= row.bbox[1] + row.bbox[3])
+    .sort((a, b) => a.bbox[2] * a.bbox[3] - b.bbox[2] * b.bbox[3]);
+  if (!matches.length) { toast("No detected box here. Use Cameras to mark a missed person.", true); return; }
+  pauseReview();
+  state.selectedReviewObservation = matches[0];
+  renderReviewSelection();
+  drawReviewOverlays();
+}
+
+function renderReviewSelection() {
+  const row = state.selectedReviewObservation;
+  $("#reviewSelection").hidden = !row;
+  if (!row) return;
+  const camera = state.project.cameras.find(item => item.id === row.cameraId);
+  $("#reviewSelectedName").textContent = identityLabel(row.globalId);
+  $("#reviewSelectedDetails").textContent = `${row.globalId} · ${camera?.name || row.cameraId} · ${formatClock(row.time)}${row.estimated ? " · estimated seated presence" : ""}`;
+  $("#reviewAssignStaff").disabled = !state.project.staff.length;
+  $("#reviewPrepareStaffMark").disabled = !state.project.staff.length;
+  for (const selector of ["#mergeSource", "#relabelIdentity", "#splitIdentity"]) {
+    if ([...$(selector).options].some(option => option.value === row.globalId)) $(selector).value = row.globalId;
+  }
+  $("#splitCamera").value = row.cameraId;
 }
 
 function renderIdentityControls() {
@@ -579,10 +753,12 @@ function setReviewTime(value, force = false) {
   $$(".review-feed[data-camera-id]").forEach(feed => {
     const camera = state.project.cameras.find(item => item.id === feed.dataset.cameraId);
     const video = $("video", feed);
-    const localTime = state.reviewTime - Number(camera?.timeOffsetSeconds || 0);
+    const localTime = state.reviewTime - effectiveCameraOffset(camera);
     const inRange = localTime >= 0 && localTime <= Number(camera?.metadata?.durationSeconds || video.duration || 0);
     feed.style.opacity = inRange ? "1" : ".28";
-    if (inRange && (force || Math.abs(video.currentTime - localTime) > .28)) video.currentTime = localTime;
+    if (!inRange) { if (!video.paused) video.pause(); return; }
+    if (force || Math.abs(video.currentTime - localTime) > .12) video.currentTime = localTime;
+    if (state.reviewPlaying && video.paused) video.play().catch(() => {});
   });
   drawReviewOverlays();
 }
@@ -592,11 +768,18 @@ function drawReviewOverlays() {
     const camera = state.project.cameras.find(item => item.id === feed.dataset.cameraId);
     const canvas = $("canvas", feed), ctx = canvas.getContext("2d");
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const localGlobalTime = state.reviewTime;
+    const localGlobalTime = displayedReviewTime(feed);
     observationsAt(camera.id, localGlobalTime).forEach((observation, index) => {
       const [x, y, width, height] = observation.bbox;
-      const color = observation.identityConfidence > 0 && observation.identityConfidence < .45 ? "#e0a63d" : observation.role === "staff" ? "#ff745e" : "#55d48b";
-      ctx.strokeStyle = color; ctx.lineWidth = Math.max(2, canvas.width / 400); ctx.strokeRect(x * canvas.width, y * canvas.height, width * canvas.width, height * canvas.height);
+      const color = observation.needsReview || observation.role === "unresolved" || observation.identityConfidence > 0 && observation.identityConfidence < .45 ? "#e0a63d" : observation.role === "staff" ? "#ff745e" : "#55d48b";
+      ctx.strokeStyle = color; ctx.lineWidth = Math.max(2, canvas.width / 400);
+      ctx.setLineDash(observation.estimated ? [12, 8] : []);
+      ctx.strokeRect(x * canvas.width, y * canvas.height, width * canvas.width, height * canvas.height);
+      ctx.setLineDash([]);
+      if (state.selectedReviewObservation === observation) {
+        ctx.strokeStyle = "#fff24b"; ctx.lineWidth = Math.max(4, canvas.width / 220);
+        ctx.strokeRect(x * canvas.width - 3, y * canvas.height - 3, width * canvas.width + 6, height * canvas.height + 6);
+      }
       const label = `${identityLabel(observation.globalId)}${observation.tableId ? ` · T${state.project.tables.find(table => table.id === observation.tableId)?.number || "?"}` : ""}`;
       ctx.font = `700 ${Math.max(11, canvas.width / 70)}px system-ui`;
       const labelWidth = ctx.measureText(label).width + 12;
@@ -608,11 +791,11 @@ function drawReviewOverlays() {
   if (map) {
     paintMap(map);
     const ctx = map.getContext("2d");
-    const current = state.project.cameras.flatMap(camera => observationsAt(camera.id, state.reviewTime)).filter(item => item.map);
+    const current = $$(".review-feed[data-camera-id]").flatMap(feed => observationsAt(feed.dataset.cameraId, displayedReviewTime(feed))).filter(item => item.map);
     const unique = new Map(); current.forEach(item => unique.set(item.globalId, item));
     [...unique.values()].forEach((observation, index) => {
       const x = observation.map[0] * map.width, y = observation.map[1] * map.height;
-      marker(ctx, x, y, identityLabel(observation.globalId).replace("Customer ", "C"), observation.role === "staff" ? "#ff745e" : "#2e9961");
+      marker(ctx, x, y, identityLabel(observation.globalId).replace("Customer ", "C"), observation.needsReview || observation.role === "unresolved" ? "#e0a63d" : observation.role === "staff" ? "#ff745e" : "#2e9961");
     });
   }
 }
@@ -628,7 +811,7 @@ function playReview() {
   if (state.reviewTime >= state.reviewDuration) state.reviewTime = 0;
   state.reviewPlaying = true; state.reviewBaseTime = state.reviewTime; state.reviewStartedAt = performance.now();
   $("#reviewPlayButton").textContent = "Pause";
-  $$(".review-feed video").forEach(video => video.play().catch(() => {}));
+  setReviewTime(state.reviewTime, true);
   const tick = now => {
     if (!state.reviewPlaying) return;
     const next = state.reviewBaseTime + (now - state.reviewStartedAt) / 1000;
@@ -648,7 +831,8 @@ async function submitCorrection(payload, button) {
   button.disabled = true;
   try {
     const value = await api("/api/corrections", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    state.results = value.results; renderReview(); renderReports(); toast("Correction saved and reports recalculated");
+    state.results = value.results; state.selectedReviewObservation = null;
+    renderReview(); renderReports(); toast("Correction saved and reports recalculated");
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; }
 }
@@ -672,9 +856,9 @@ async function pollJob(jobId) {
     $("#progressPercent").textContent = `${progress}%`;
     $("#progressBar").style.width = `${progress}%`;
     if (job.status === "complete") {
-      const response = await api("/api/results");
-      state.results = response.results;
-      renderReports(); renderReadiness(); toast(job.message || "Analysis complete"); showView("reports"); return;
+      const [response, project] = await Promise.all([api("/api/results"), api("/api/project")]);
+      state.results = response.results; state.project = project;
+      renderAll(); toast(job.message || "Analysis complete"); showView("reports"); return;
     }
     if (job.status === "error") { renderReadiness(); throw new Error(job.message || "Analysis failed"); }
     await new Promise(resolve => setTimeout(resolve, 1000));
@@ -745,6 +929,100 @@ function bindEvents() {
     catch (error) { toast(error.message, true); }
     finally { button.disabled = false; button.textContent = "Add camera"; }
   });
+  $("#syncTimestampsButton").addEventListener("click", async event => {
+    const button = event.target; button.disabled = true; button.textContent = "Reading camera clocks…";
+    try {
+      const value = await api("/api/timestamps/sync", { method: "POST" });
+      state.project = value.project; renderCameras(); renderReports();
+      const verified = value.timestampSync.cameras.filter(row => row.status === "verified").length;
+      toast(value.timestampSync.applied ? `${verified} camera clocks checked; offsets updated. Rerun analysis.` : `${verified} camera clocks checked; existing offsets kept.`);
+    } catch (error) { toast(error.message, true); }
+    finally { button.textContent = "Sync camera times"; button.disabled = false; }
+  });
+  $("#timestampSyncList").addEventListener("change", async event => {
+    const input = event.target.closest("[data-clock-adjust-camera]");
+    if (!input) return;
+    const camera = state.project.cameras.find(item => item.id === input.dataset.clockAdjustCamera);
+    const updated = Number(input.value);
+    if (!camera || !Number.isFinite(updated) || Math.abs(updated) > 30) {
+      toast("Choose a fine shift between -30 and 30 seconds", true); renderCameraClocks(); return;
+    }
+    const previous = Number(camera.manualTimeAdjustmentSeconds || 0);
+    camera.manualTimeAdjustmentSeconds = updated;
+    camera.timeOffsetSeconds = Math.round((Number(camera.timeOffsetSeconds || 0) + updated - previous) * 100) / 100;
+    state.project.timestampSyncUpdatedAt = new Date().toISOString();
+    await saveProject(true); renderCameras(); renderReports(); renderReview();
+    toast("Camera time adjusted. Rerun analysis for corrected identities and metrics.");
+  });
+  $("#manualCameraSelect").addEventListener("change", event => {
+    state.manualCameraId = event.target.value; state.manualBox = null;
+    renderManualMarks();
+  });
+  $("#manualVideo").addEventListener("timeupdate", event => {
+    $("#manualTimeline").value = event.target.currentTime;
+    $("#manualCurrentTime").textContent = formatClock(event.target.currentTime);
+    drawManualCanvas();
+  });
+  $("#manualVideo").addEventListener("pause", () => $("#manualPlayButton").textContent = "Play");
+  $("#manualVideo").addEventListener("play", () => $("#manualPlayButton").textContent = "Pause");
+  $("#manualPlayButton").addEventListener("click", () => {
+    const video = $("#manualVideo");
+    if (!manualCamera()) return;
+    if (video.paused) video.play().catch(() => toast("Could not play this video", true)); else video.pause();
+  });
+  $("#manualTimeline").addEventListener("input", event => {
+    const video = $("#manualVideo"); video.pause(); video.currentTime = Number(event.target.value);
+    $("#manualCurrentTime").textContent = formatClock(video.currentTime);
+    drawManualCanvas();
+  });
+  $("#manualRole").addEventListener("change", event => $("#manualStaffWrap").hidden = event.target.value !== "staff");
+  const manualCanvas = $("#manualCanvas");
+  manualCanvas.addEventListener("pointerdown", event => {
+    if (!manualCamera()) return;
+    const video = $("#manualVideo"); video.pause();
+    const point = eventPoint(manualCanvas, event);
+    state.manualDrag = { start: point, end: point };
+    manualCanvas.setPointerCapture(event.pointerId);
+    drawManualCanvas();
+  });
+  manualCanvas.addEventListener("pointermove", event => {
+    if (!state.manualDrag) return;
+    state.manualDrag.end = eventPoint(manualCanvas, event); drawManualCanvas();
+  });
+  manualCanvas.addEventListener("pointerup", event => {
+    if (!state.manualDrag) return;
+    state.manualDrag.end = eventPoint(manualCanvas, event);
+    const { start, end } = state.manualDrag; state.manualDrag = null;
+    const box = [Math.min(start.x, end.x), Math.min(start.y, end.y), Math.abs(end.x - start.x), Math.abs(end.y - start.y)];
+    if (box[2] < .015 || box[3] < .015) { toast("Drag a larger box around one person", true); drawManualCanvas(); return; }
+    state.manualBox = box.map(value => Number(value.toFixed(5)));
+    const current = Number($("#manualVideo").currentTime || 0);
+    const duration = Number(manualCamera()?.metadata?.durationSeconds || $("#manualVideo").duration || 0);
+    $("#manualStart").value = current.toFixed(1);
+    $("#manualEnd").value = Math.min(duration, current + 30).toFixed(1);
+    $("#manualDrawStatus").textContent = "Box ready. Set the time range and save.";
+    drawManualCanvas();
+  });
+  $("#manualMarkForm").addEventListener("submit", async event => {
+    event.preventDefault();
+    const camera = manualCamera();
+    if (!camera || !state.manualBox) { toast("Pause the camera and draw a person box first", true); return; }
+    const role = $("#manualRole").value;
+    const staffId = role === "staff" ? $("#manualStaff").value : null;
+    if (role === "staff" && !staffId) { toast("Enroll or choose a staff actor first", true); return; }
+    const startSeconds = Number($("#manualStart").value), endSeconds = Number($("#manualEnd").value);
+    const duration = Number(camera.metadata?.durationSeconds || 0);
+    if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || endSeconds <= startSeconds || startSeconds < 0 || endSeconds > duration + .5) {
+      toast("Set a valid start and end within the camera recording", true); return;
+    }
+    state.project.manualMarks ||= [];
+    state.project.manualMarks.push({ id: uid("mark"), cameraId: camera.id, role, staffId,
+      tableId: $("#manualTable").value || null, bbox: state.manualBox,
+      startSeconds, endSeconds });
+    await saveProject(true);
+    state.manualBox = null; $("#manualDrawStatus").textContent = "Saved. Drag another person box, or run analysis again.";
+    renderManualMarks(); toast("Person marking saved for the next analysis");
+  });
   $("#calibrationCameraSelect").addEventListener("change", event => { state.selectedCameraId = event.target.value; state.pendingImagePoint = null; state.placingCamera = false; drawCalibration(); });
   $("#cameraCanvas").addEventListener("click", event => {
     if (!selectedCamera()) return;
@@ -811,7 +1089,7 @@ function bindEvents() {
 
   $("#staffForm").addEventListener("submit", async event => {
     event.preventDefault(); const button = $('button[type="submit"]', event.target); button.disabled = true; button.textContent = "Creating profile…";
-    try { const value = await api("/api/staff", { method: "POST", body: new FormData(event.target) }); state.project = value.project; event.target.reset(); renderAll(); toast("Staff face profile created"); }
+    try { const value = await api("/api/staff", { method: "POST", body: new FormData(event.target) }); state.project = value.project; event.target.reset(); renderAll(); toast(value.staff.photoPath ? "Staff face profile created" : "Video-only staff profile created; identify them in Review"); }
     catch (error) { toast(error.message, true); }
     finally { button.disabled = false; button.textContent = "Create staff profile"; }
   });
@@ -834,6 +1112,7 @@ function bindEvents() {
       runId: state.results.runId,
       cameraSources: state.project.cameras.map(camera => ({ id: camera.id, name: camera.name, videoPath: camera.videoPath, timeOffsetSeconds: camera.timeOffsetSeconds, calibration: camera.calibration, calibrationQuality: camera.calibrationQuality })),
       layout: { tables: state.project.tables, zones: state.project.zones || [], cameraLinks: state.project.cameraLinks || [] },
+      manualMarks: state.project.manualMarks || [],
       identities: [...new Set(state.results.observations.map(item => item.globalId))].map(id => ({ id, label: identityLabel(id), role: id.startsWith("staff:") ? "staff" : "customer" })),
       observations: state.results.observations,
       tracklets: state.results.tracklets,
@@ -845,6 +1124,49 @@ function bindEvents() {
   });
   $("#reviewPlayButton").addEventListener("click", () => state.reviewPlaying ? pauseReview() : playReview());
   $("#reviewTimeline").addEventListener("input", event => { pauseReview(); setReviewTime(Number(event.target.value), true); });
+  $("#reviewSelectForCorrection").addEventListener("click", () => {
+    if (!state.selectedReviewObservation) return;
+    renderReviewSelection();
+    $(".correction-card").scrollIntoView({ behavior: "smooth", block: "center" });
+  });
+  $("#reviewAssignStaff").addEventListener("click", event => {
+    const row = state.selectedReviewObservation;
+    if (!row || !$("#reviewQuickStaff").value) return;
+    submitCorrection({ action: "relabel", identityId: row.globalId,
+      role: "staff", staffId: $("#reviewQuickStaff").value }, event.currentTarget);
+  });
+  $("#reviewPrepareStaffMark").addEventListener("click", () => {
+    const row = state.selectedReviewObservation;
+    const staffId = $("#reviewQuickStaff").value;
+    if (!row || !staffId) return;
+    const camera = state.project.cameras.find(item => item.id === row.cameraId);
+    if (!camera) return;
+    state.manualCameraId = row.cameraId;
+    renderManualMarks();
+    state.manualBox = [...row.bbox];
+    $("#manualRole").value = "staff";
+    $("#manualStaffWrap").hidden = false;
+    $("#manualStaff").value = staffId;
+    $("#manualTable").value = row.tableId || "";
+    const localTime = Math.max(0, row.time - effectiveCameraOffset(camera));
+    const duration = Number(camera.metadata?.durationSeconds || 0);
+    $("#manualStart").value = localTime.toFixed(1);
+    $("#manualEnd").value = Math.min(duration, localTime + 30).toFixed(1);
+    $("#manualDrawStatus").textContent = "Box copied from Review. Check when the actor moves or leaves, then save.";
+    const video = $("#manualVideo");
+    if (video.readyState >= 1) video.currentTime = localTime;
+    else video.addEventListener("loadedmetadata", () => { video.currentTime = localTime; drawManualCanvas(); }, { once: true });
+    $("#manualTimeline").value = localTime;
+    $("#manualCurrentTime").textContent = formatClock(localTime);
+    drawManualCanvas();
+    showView("cameras");
+    $("#manualPanel").scrollIntoView({ behavior: "smooth", block: "center" });
+  });
+  $("#reviewAssignCustomer").addEventListener("click", event => {
+    const row = state.selectedReviewObservation;
+    if (!row) return;
+    submitCorrection({ action: "relabel", identityId: row.globalId, role: "customer" }, event.currentTarget);
+  });
   $("#relabelRole").addEventListener("change", event => $("#relabelStaffWrap").hidden = event.target.value !== "staff");
   $("#mergeForm").addEventListener("submit", event => {
     event.preventDefault();
